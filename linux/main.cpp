@@ -608,6 +608,10 @@ private slots:
 
         LOG_INFO("Connecting to device: " << device.name());
 
+        // Pause BLE scanning while we open the AAP L2CAP socket. Scanning runs
+        // on the same controller and adds contention during the connect window.
+        m_bleManager->stopScan();
+
         // Clean up any existing socket
         if (socket)
         {
@@ -627,26 +631,43 @@ private slots:
             QByteArray data = localSocket->readAll();
             QMetaObject::invokeMethod(this, "parseData", Qt::QueuedConnection, Q_ARG(QByteArray, data));
             QMetaObject::invokeMethod(this, "relayPacketToPhone", Qt::QueuedConnection, Q_ARG(QByteArray, data)); });
+            // The AAP L2CAP socket is up. Reset retry state and notify the UI
+            // now, rather than waiting for METADATA at the end of the handshake.
+            // Previously airPodsStatusChanged was only emitted after the whole
+            // handshake completed, so the UI lagged the Bluetooth link badly.
+            m_retryCount = 0;
             sendHandshake();
+            emit airPodsStatusChanged();
         };
 
         // Error handler with retry
         auto handleError = [this, device, localSocket](QBluetoothSocket::SocketError error)
         {
+            // Ignore errors from a socket that a retry has already replaced.
+            if (localSocket != socket)
+            {
+                return;
+            }
+
             LOG_ERROR("Socket error: " << error << ", " << localSocket->errorString());
 
-            static int retryCount = 0;
-            if (retryCount < m_retryAttempts)
+            if (m_retryCount < m_retryAttempts)
             {
-                retryCount++;
-                LOG_INFO("Retrying connection (attempt " << retryCount << ")");
-                QTimer::singleShot(1500, this, [this, device]()
+                m_retryCount++;
+                // Shorter, gently exponential backoff (500ms, 1000ms, 2000ms...).
+                // The most common failure is the AAP service not being ready for
+                // a fraction of a second, so a flat 1.5s wait was far too long.
+                const int delayMs = qMin(2000, 500 * (1 << (m_retryCount - 1)));
+                LOG_INFO("Retrying connection (attempt " << m_retryCount << ") in " << delayMs << "ms");
+                QTimer::singleShot(delayMs, this, [this, device]()
                                    { connectToDevice(device); });
             }
             else
             {
-                LOG_ERROR("Failed to connect after 3 attempts");
-                retryCount = 0;
+                LOG_ERROR("Failed to connect after " << m_retryAttempts << " attempts");
+                m_retryCount = 0;
+                // Give up: resume BLE scanning so battery/ear state keeps working.
+                m_bleManager->startScan();
             }
         };
 
@@ -981,6 +1002,7 @@ private:
     QSettings *m_settings;
     AutoStartManager *m_autoStartManager;
     int m_retryAttempts = 3;
+    int m_retryCount = 0;
     bool m_hideOnStart = false;
     DeviceInfo *m_deviceInfo;
     BleManager *m_bleManager;

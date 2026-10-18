@@ -5,6 +5,11 @@
 #include <QDBusObjectPath>
 #include <QDBusMetaType>
 
+namespace {
+// Apple AAP L2CAP service UUID advertised by AirPods.
+const QString kAirPodsServiceUuid = QStringLiteral("74ec2172-0bad-4d01-8f77-997b2be0722a");
+}
+
 BluetoothMonitor::BluetoothMonitor(QObject *parent)
     : QObject(parent), m_dbus(QDBusConnection::systemBus())
 {
@@ -35,32 +40,76 @@ void BluetoothMonitor::registerDBusService()
     {
         LOG_WARN("Failed to connect to D-Bus PropertiesChanged signal");
     }
+
+    // Warm the device property cache as devices appear, so that the connect
+    // path never has to issue blocking D-Bus Get calls.
+    if (!m_dbus.connect("org.bluez", "", "org.freedesktop.DBus.ObjectManager", "InterfacesAdded",
+                        this, SLOT(onInterfacesAdded(QDBusObjectPath, QMap<QString, QVariantMap>))))
+    {
+        LOG_WARN("Failed to connect to D-Bus InterfacesAdded signal");
+    }
 }
 
 bool BluetoothMonitor::isAirPodsDevice(const QString &devicePath)
 {
+    const auto cached = m_isAirPodsCache.constFind(devicePath);
+    if (cached != m_isAirPodsCache.constEnd())
+    {
+        return cached.value();
+    }
+
     QDBusInterface deviceInterface("org.bluez", devicePath, "org.freedesktop.DBus.Properties", m_dbus);
 
     // Get UUIDs to check if it's an AirPods device
     QDBusReply<QVariant> uuidsReply = deviceInterface.call("Get", "org.bluez.Device1", "UUIDs");
     if (!uuidsReply.isValid())
     {
+        // Don't cache a transient failure; the device may not be ready yet.
         return false;
     }
 
-    QStringList uuids = uuidsReply.value().toStringList();
-    return uuids.contains("74ec2172-0bad-4d01-8f77-997b2be0722a");
+    const bool isAirPods = uuidsReply.value().toStringList().contains(kAirPodsServiceUuid);
+    m_isAirPodsCache.insert(devicePath, isAirPods);
+    return isAirPods;
 }
 
 QString BluetoothMonitor::getDeviceName(const QString &devicePath)
 {
+    const auto cached = m_deviceNames.constFind(devicePath);
+    if (cached != m_deviceNames.constEnd())
+    {
+        return cached.value();
+    }
+
     QDBusInterface deviceInterface("org.bluez", devicePath, "org.freedesktop.DBus.Properties", m_dbus);
     QDBusReply<QVariant> nameReply = deviceInterface.call("Get", "org.bluez.Device1", "Name");
     if (nameReply.isValid())
     {
-        return nameReply.value().toString();
+        const QString name = nameReply.value().toString();
+        m_deviceNames.insert(devicePath, name);
+        return name;
     }
     return "Unknown";
+}
+
+QString BluetoothMonitor::getDeviceAddress(const QString &devicePath)
+{
+    const auto cached = m_deviceAddresses.constFind(devicePath);
+    if (cached != m_deviceAddresses.constEnd())
+    {
+        return cached.value();
+    }
+
+    QDBusInterface deviceInterface("org.bluez", devicePath, "org.freedesktop.DBus.Properties", m_dbus);
+    QDBusReply<QVariant> addrReply = deviceInterface.call("Get", "org.bluez.Device1", "Address");
+    if (!addrReply.isValid())
+    {
+        return QString();
+    }
+
+    const QString address = addrReply.value().toString();
+    m_deviceAddresses.insert(devicePath, address);
+    return address;
 }
 
 bool BluetoothMonitor::checkAlreadyConnectedDevices()
@@ -98,7 +147,12 @@ bool BluetoothMonitor::checkAlreadyConnectedDevices()
             }
 
             QStringList uuids = deviceProps["UUIDs"].toStringList();
-            bool isAirPods = uuids.contains("74ec2172-0bad-4d01-8f77-997b2be0722a");
+            bool isAirPods = uuids.contains(kAirPodsServiceUuid);
+
+            // Cache everything we just read so the connect path can avoid Gets.
+            m_isAirPodsCache.insert(objPath.path(), isAirPods);
+            m_deviceNames.insert(objPath.path(), deviceProps["Name"].toString());
+            m_deviceAddresses.insert(objPath.path(), deviceProps["Address"].toString());
 
             if (isAirPods)
             {
@@ -115,6 +169,32 @@ bool BluetoothMonitor::checkAlreadyConnectedDevices()
         }
     }
     return deviceFound;
+}
+
+void BluetoothMonitor::onInterfacesAdded(const QDBusObjectPath &objectPath, const QMap<QString, QVariantMap> &interfaces)
+{
+    const QString path = objectPath.path();
+    if (path.isEmpty() || !interfaces.contains("org.bluez.Device1"))
+    {
+        return;
+    }
+
+    const QVariantMap &props = interfaces.value("org.bluez.Device1");
+
+    // Only cache the AirPods flag once UUIDs are known, so we never poison the
+    // cache with a "false" for a device whose UUIDs have not been populated yet.
+    if (props.contains("UUIDs"))
+    {
+        m_isAirPodsCache.insert(path, props["UUIDs"].toStringList().contains(kAirPodsServiceUuid));
+    }
+    if (props.contains("Name"))
+    {
+        m_deviceNames.insert(path, props["Name"].toString());
+    }
+    if (props.contains("Address"))
+    {
+        m_deviceAddresses.insert(path, props["Address"].toString());
+    }
 }
 
 void BluetoothMonitor::onPropertiesChanged(const QString &interface, const QVariantMap &changedProps, const QStringList &invalidatedProps)
@@ -136,15 +216,13 @@ void BluetoothMonitor::onPropertiesChanged(const QString &interface, const QVari
             return;
         }
 
-        QDBusInterface deviceInterface("org.bluez", path, "org.freedesktop.DBus.Properties", m_dbus);
-
-        // Get the device address
-        QDBusReply<QVariant> addrReply = deviceInterface.call("Get", "org.bluez.Device1", "Address");
-        if (!addrReply.isValid())
+        // Address/Name are read from the cache populated on discovery; this
+        // avoids blocking D-Bus round-trips on the connect critical path.
+        QString macAddress = getDeviceAddress(path);
+        if (macAddress.isEmpty())
         {
             return;
         }
-        QString macAddress = addrReply.value().toString();
         QString deviceName = getDeviceName(path);
 
         if (connected)
