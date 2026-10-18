@@ -75,13 +75,17 @@ ApplicationWindow {
                     width: 120
                     height: 24
                     radius: 12
-                    color: airPodsTrayApp.airpodsConnected ? "#30D158" : "#FF453A"
+                    color: airPodsTrayApp.connectionState === "connected" ? "#30D158"
+                         : airPodsTrayApp.connectionState === "connecting" ? "#FFD60A"
+                         : "#FF453A"
                     opacity: 0.8
-                    visible: !airPodsTrayApp.airpodsConnected
+                    visible: airPodsTrayApp.connectionState !== "connected"
 
                     Label {
                         anchors.centerIn: parent
-                        text: airPodsTrayApp.airpodsConnected ? qsTr("Connected") : qsTr("Disconnected")
+                        text: airPodsTrayApp.connectionState === "connected" ? qsTr("Connected")
+                            : airPodsTrayApp.connectionState === "connecting" ? qsTr("Connecting…")
+                            : qsTr("Disconnected")
                         color: "white"
                         font.pixelSize: 12
                         font.weight: Font.Medium

@@ -19,6 +19,8 @@ set(TS_FILES
 qt_add_executable(librepods
     main.cpp
     logger.h
+    aapsocket.cpp
+    aapsocket.h
     media/mediacontroller.cpp
     media/mediacontroller.h
     media/pulseaudiocontroller.cpp

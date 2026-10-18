@@ -19,6 +19,7 @@
 
 #include "airpods_packets.h"
 #include "logger.h"
+#include "aapsocket.h"
 #include "media/mediacontroller.h"
 #include "trayiconmanager.h"
 #include "enums.h"
@@ -38,6 +39,7 @@ Q_LOGGING_CATEGORY(librepods, "librepods")
 class AirPodsTrayApp : public QObject {
     Q_OBJECT
     Q_PROPERTY(bool airpodsConnected READ areAirpodsConnected NOTIFY airPodsStatusChanged)
+    Q_PROPERTY(QString connectionState READ connectionState NOTIFY airPodsStatusChanged)
     Q_PROPERTY(int earDetectionBehavior READ earDetectionBehavior WRITE setEarDetectionBehavior NOTIFY earDetectionBehaviorChanged)
     Q_PROPERTY(bool crossDeviceEnabled READ crossDeviceEnabled WRITE setCrossDeviceEnabled NOTIFY crossDeviceEnabledChanged)
     Q_PROPERTY(AutoStartManager *autoStartManager READ autoStartManager CONSTANT)
@@ -126,7 +128,19 @@ public:
         delete phoneSocket;
     }
 
-    bool areAirpodsConnected() const { return socket && socket->isOpen() && socket->state() == QBluetoothSocket::SocketState::ConnectedState; }
+    bool areAirpodsConnected() const { return socket && socket->isOpen(); }
+    QString connectionState() const
+    {
+        if (socket && socket->isOpen())
+        {
+            return QStringLiteral("connected");
+        }
+        if (m_connecting)
+        {
+            return QStringLiteral("connecting");
+        }
+        return QStringLiteral("disconnected");
+    }
     int earDetectionBehavior() const { return mediaController->getEarDetectionBehavior(); }
     bool crossDeviceEnabled() const { return CrossDevice.isEnabled; }
     AutoStartManager *autoStartManager() const { return m_autoStartManager; }
@@ -506,10 +520,12 @@ private slots:
     void onDeviceDisconnected(const QBluetoothAddress &address)
     {
         LOG_INFO("Device disconnected: " << address.toString());
+        m_connecting = false;
         if (socket)
         {
             LOG_WARN("Socket is still open, closing it");
             socket->close();
+            socket->deleteLater();
             socket = nullptr;
         }
         if (phoneSocket && phoneSocket->isOpen())
@@ -600,7 +616,7 @@ private slots:
 
     void connectToDevice(const QBluetoothDeviceInfo &device)
     {
-        if (socket && socket->isOpen() && socket->peerAddress() == device.address())
+        if (socket && socket->isOpen() && socket->address() == device.address().toString())
         {
             LOG_INFO("Already connected to the device: " << device.name());
             return;
@@ -620,13 +636,15 @@ private slots:
             socket = nullptr;
         }
 
-        QBluetoothSocket *localSocket = new QBluetoothSocket(QBluetoothServiceInfo::L2capProtocol);
+        AapSocket *localSocket = new AapSocket(this);
         socket = localSocket;
+        m_connecting = true;
+        emit airPodsStatusChanged();
 
         // Connection handler
         auto handleConnection = [this, localSocket]()
         {
-            connect(localSocket, &QBluetoothSocket::readyRead, this, [this, localSocket]()
+            connect(localSocket, &AapSocket::readyRead, this, [this, localSocket]()
                     {
             QByteArray data = localSocket->readAll();
             QMetaObject::invokeMethod(this, "parseData", Qt::QueuedConnection, Q_ARG(QByteArray, data));
@@ -636,12 +654,13 @@ private slots:
             // Previously airPodsStatusChanged was only emitted after the whole
             // handshake completed, so the UI lagged the Bluetooth link badly.
             m_retryCount = 0;
+            m_connecting = false;
             sendHandshake();
             emit airPodsStatusChanged();
         };
 
         // Error handler with retry
-        auto handleError = [this, device, localSocket](QBluetoothSocket::SocketError error)
+        auto handleError = [this, device, localSocket](const QString &message)
         {
             // Ignore errors from a socket that a retry has already replaced.
             if (localSocket != socket)
@@ -649,7 +668,7 @@ private slots:
                 return;
             }
 
-            LOG_ERROR("Socket error: " << error << ", " << localSocket->errorString());
+            LOG_ERROR("Socket error: " << message);
 
             if (m_retryCount < m_retryAttempts)
             {
@@ -666,16 +685,17 @@ private slots:
             {
                 LOG_ERROR("Failed to connect after " << m_retryAttempts << " attempts");
                 m_retryCount = 0;
+                m_connecting = false;
+                emit airPodsStatusChanged();
                 // Give up: resume BLE scanning so battery/ear state keeps working.
                 m_bleManager->startScan();
             }
         };
 
-        connect(localSocket, &QBluetoothSocket::connected, this, handleConnection);
-        connect(localSocket, QOverload<QBluetoothSocket::SocketError>::of(&QBluetoothSocket::errorOccurred),
-                this, handleError);
+        connect(localSocket, &AapSocket::connected, this, handleConnection);
+        connect(localSocket, &AapSocket::errorOccurred, this, handleError);
 
-        localSocket->connectToService(device.address(), QBluetoothUuid("74ec2172-0bad-4d01-8f77-997b2be0722a"));
+        localSocket->connectToDevice(device.address().toString());
         m_deviceInfo->setBluetoothAddress(device.address().toString());
         notifyAndroidDevice();
     }
@@ -992,7 +1012,7 @@ signals:
     void hearingAidEnabledChanged(bool enabled);
 
 private:
-    QBluetoothSocket *socket = nullptr;
+    AapSocket *socket = nullptr;
     QBluetoothSocket *phoneSocket = nullptr;
     QByteArray lastBatteryStatus;
     QByteArray lastEarDetectionStatus;
@@ -1003,6 +1023,7 @@ private:
     AutoStartManager *m_autoStartManager;
     int m_retryAttempts = 3;
     int m_retryCount = 0;
+    bool m_connecting = false;
     bool m_hideOnStart = false;
     DeviceInfo *m_deviceInfo;
     BleManager *m_bleManager;
