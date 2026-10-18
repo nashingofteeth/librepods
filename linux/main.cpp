@@ -952,11 +952,20 @@ private slots:
 
 public:
     void handleMediaStateChange(MediaController::MediaState state) {
-        if (state == MediaController::MediaState::Playing) {
-            LOG_INFO("Media started playing, sending disconnect request to Android and taking over audio");
-            sendDisconnectRequestToAndroid();
-            connectToAirPods(true);
+        if (state != MediaController::MediaState::Playing) {
+            return;
         }
+
+        // This is the cross-device "take over audio" path. Without cross-device
+        // there is nothing to take over from, and force-connecting here would
+        // fight a user-initiated disconnect, so do nothing.
+        if (!CrossDevice.isEnabled) {
+            return;
+        }
+
+        LOG_INFO("Media started playing, sending disconnect request to Android and taking over audio");
+        sendDisconnectRequestToAndroid();
+        connectToAirPods(true);
     }
 
     void sendDisconnectRequestToAndroid()
