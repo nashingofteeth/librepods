@@ -23,8 +23,8 @@ const QString kA2dpSinkUuid = QStringLiteral("0000110b-0000-1000-8000-00805f9b34
 // How long to keep asking BlueZ to bring up A2DP after a reconnect, and how
 // often. The first request often fails with br-connection-create-socket while
 // the AirPods are still settling, so a single attempt is not enough.
-constexpr int kMaxA2dpProfileAttempts = 10;
-constexpr int kA2dpProfileRetryMs = 2000;
+constexpr int kMaxA2dpProfileAttempts = 15;
+constexpr int kA2dpProfileRetryMs = 1000;
 }
 
 MediaController::MediaController(QObject *parent) : QObject(parent) {
