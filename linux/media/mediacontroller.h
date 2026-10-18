@@ -41,6 +41,7 @@ public:
   bool isA2dpProfileAvailable();
   QString getPreferredA2dpProfile();
   bool restartWirePlumber();
+  bool connectA2dpProfile();
 
   void setEarDetectionBehavior(EarDetectionBehavior behavior);
   inline EarDetectionBehavior getEarDetectionBehavior() const { return earDetectionBehavior; }
@@ -55,6 +56,7 @@ Q_SIGNALS:
 private:
   MediaState mediaStateFromPlayerctlOutput(const QString &output) const;
   QString getAudioDeviceName();
+  QString findBluezDevicePath(const QString &macWithUnderscores) const;
   QStringList getPlayingMediaPlayers();
 
   QStringList pausedByAppServices;
@@ -65,6 +67,8 @@ private:
   PlayerStatusWatcher *playerStatusWatcher = nullptr;
   PulseAudioController *m_pulseAudio = nullptr;
   QString m_cachedA2dpProfile;
+  // Set once per connection after asking BlueZ to bring up the A2DP transport.
+  bool m_a2dpProfileRequested = false;
 };
 
 #endif // MEDIACONTROLLER_H

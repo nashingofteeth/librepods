@@ -7,9 +7,20 @@
 #include <QDebug>
 #include <QProcess>
 #include <QThread>
+#include <QTimer>
 #include <QRegularExpression>
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
+#include <QDBusInterface>
+#include <QDBusMessage>
+#include <QDBusReply>
+#include <QDBusArgument>
+#include <QDBusObjectPath>
+
+namespace {
+// BlueZ A2DP sink profile UUID.
+const QString kA2dpSinkUuid = QStringLiteral("0000110b-0000-1000-8000-00805f9b34fb");
+}
 
 MediaController::MediaController(QObject *parent) : QObject(parent) {
   m_pulseAudio = new PulseAudioController(this);
@@ -197,8 +208,32 @@ bool MediaController::restartWirePlumber() {
 }
 
 void MediaController::activateA2dpProfile() {
-  if (connectedDeviceMacAddress.isEmpty() || m_deviceOutputName.isEmpty()) {
-    LOG_WARN("Connected device MAC address or output name is empty, cannot activate A2DP profile");
+  if (connectedDeviceMacAddress.isEmpty()) {
+    LOG_WARN("Connected device MAC address is empty, cannot activate A2DP profile");
+    return;
+  }
+
+  // Re-resolve the PipeWire card if we don't have it yet.
+  if (m_deviceOutputName.isEmpty()) {
+    m_deviceOutputName = getAudioDeviceName();
+  }
+
+  // After a case -> ears reconnect the AirPods may come back with only the AACP
+  // link up and no A2DP transport, so PipeWire never creates a bluez_card and
+  // there is no output device at all. Ask BlueZ to connect the A2DP profile,
+  // then retry once after WirePlumber has had a moment to create the card.
+  // See https://github.com/librepods-org/librepods/issues/799
+  if (m_deviceOutputName.isEmpty()) {
+    if (!m_a2dpProfileRequested) {
+      m_a2dpProfileRequested = true;
+      LOG_INFO("No Bluetooth audio card for " << connectedDeviceMacAddress
+               << ", requesting A2DP profile via BlueZ");
+      if (connectA2dpProfile()) {
+        QTimer::singleShot(1000, this, &MediaController::activateA2dpProfile);
+      }
+    } else {
+      LOG_WARN("A2DP card still not available for " << connectedDeviceMacAddress);
+    }
     return;
   }
 
@@ -229,6 +264,53 @@ void MediaController::activateA2dpProfile() {
   LOG_INFO("A2DP profile activated successfully");
 }
 
+bool MediaController::connectA2dpProfile() {
+  const QString devicePath = findBluezDevicePath(connectedDeviceMacAddress);
+  if (devicePath.isEmpty()) {
+    LOG_ERROR("Could not find BlueZ device path for MAC: " << connectedDeviceMacAddress);
+    return false;
+  }
+
+  QDBusInterface device("org.bluez", devicePath, "org.bluez.Device1",
+                        QDBusConnection::systemBus());
+  if (!device.isValid()) {
+    LOG_ERROR("BlueZ device interface not valid for " << devicePath);
+    return false;
+  }
+
+  QDBusMessage reply = device.call("ConnectProfile", kA2dpSinkUuid);
+  if (reply.type() == QDBusMessage::ErrorMessage) {
+    LOG_ERROR("BlueZ ConnectProfile(A2DP) failed: " << reply.errorMessage());
+    return false;
+  }
+
+  LOG_INFO("Requested A2DP profile connection via BlueZ for " << connectedDeviceMacAddress);
+  return true;
+}
+
+QString MediaController::findBluezDevicePath(const QString &macWithUnderscores) const {
+  QDBusInterface objectManager("org.bluez", "/", "org.freedesktop.DBus.ObjectManager",
+                               QDBusConnection::systemBus());
+  QDBusMessage reply = objectManager.call("GetManagedObjects");
+  if (reply.type() == QDBusMessage::ErrorMessage) {
+    LOG_ERROR("GetManagedObjects failed: " << reply.errorMessage());
+    return QString();
+  }
+
+  const QVariant firstArg = reply.arguments().constFirst();
+  QDBusArgument arg = firstArg.value<QDBusArgument>();
+  QMap<QDBusObjectPath, QMap<QString, QVariantMap>> managedObjects;
+  arg >> managedObjects;
+
+  const QString suffix = QStringLiteral("/dev_") + macWithUnderscores.toUpper();
+  for (auto it = managedObjects.constBegin(); it != managedObjects.constEnd(); ++it) {
+    if (it.key().path().endsWith(suffix)) {
+      return it.key().path();
+    }
+  }
+  return QString();
+}
+
 void MediaController::removeAudioOutputDevice() {
   if (connectedDeviceMacAddress.isEmpty() || m_deviceOutputName.isEmpty()) {
     LOG_WARN("Connected device MAC address or output name is empty, cannot remove audio output device");
@@ -245,6 +327,8 @@ void MediaController::setConnectedDeviceMacAddress(const QString &macAddress) {
   connectedDeviceMacAddress = macAddress;
   m_deviceOutputName = getAudioDeviceName();
   m_cachedA2dpProfile.clear();
+  // Allow one A2DP ConnectProfile request for this connection.
+  m_a2dpProfileRequested = false;
   LOG_INFO("Device output name set to: " << m_deviceOutputName);
 }
 
