@@ -83,6 +83,20 @@ public:
         connect(monitor, &BluetoothMonitor::deviceConnected, this, &AirPodsTrayApp::bluezDeviceConnected);
         connect(monitor, &BluetoothMonitor::deviceDisconnected, this, &AirPodsTrayApp::bluezDeviceDisconnected);
 
+        // Single-shot timer for AAP reconnect retries. It is cancelled whenever
+        // the device disconnects: opening an L2CAP socket to a disconnected
+        // device makes the kernel page it and bring the Bluetooth link back up,
+        // which would fight a user-initiated disconnect.
+        m_retryTimer = new QTimer(this);
+        m_retryTimer->setSingleShot(true);
+        connect(m_retryTimer, &QTimer::timeout, this, [this]()
+                {
+                    if (!m_retryAddress.isEmpty())
+                    {
+                        connectToDevice(m_retryAddress);
+                    }
+                });
+
         connect(m_bleManager, &BleManager::deviceFound, this, &AirPodsTrayApp::bleDeviceFound);
         connect(m_deviceInfo->getBattery(), &Battery::primaryChanged, this, &AirPodsTrayApp::primaryChanged);
         connect(m_systemSleepMonitor, &SystemSleepMonitor::systemGoingToSleep, this, &AirPodsTrayApp::onSystemGoingToSleep);
@@ -521,6 +535,13 @@ private slots:
     {
         LOG_INFO("Device disconnected: " << address.toString());
         m_connecting = false;
+        // Cancel any pending AAP reconnect retry so we do not page the AirPods
+        // straight back up (which would defeat a user-initiated disconnect).
+        if (m_retryTimer)
+        {
+            m_retryTimer->stop();
+        }
+        m_retryCount = 0;
         if (socket)
         {
             LOG_WARN("Socket is still open, closing it");
@@ -655,6 +676,10 @@ private slots:
             // handshake completed, so the UI lagged the Bluetooth link badly.
             m_retryCount = 0;
             m_connecting = false;
+            if (m_retryTimer)
+            {
+                m_retryTimer->stop();
+            }
             sendHandshake();
             emit airPodsStatusChanged();
         };
@@ -678,8 +703,8 @@ private slots:
                 // a fraction of a second, so a flat 1.5s wait was far too long.
                 const int delayMs = qMin(2000, 500 * (1 << (m_retryCount - 1)));
                 LOG_INFO("Retrying connection (attempt " << m_retryCount << ") in " << delayMs << "ms");
-                QTimer::singleShot(delayMs, this, [this, device]()
-                                   { connectToDevice(device); });
+                m_retryAddress = device.address().toString();
+                m_retryTimer->start(delayMs);
             }
             else
             {
@@ -1024,6 +1049,8 @@ private:
     int m_retryAttempts = 3;
     int m_retryCount = 0;
     bool m_connecting = false;
+    QTimer *m_retryTimer = nullptr;
+    QString m_retryAddress;
     bool m_hideOnStart = false;
     DeviceInfo *m_deviceInfo;
     BleManager *m_bleManager;
