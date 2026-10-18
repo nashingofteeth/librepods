@@ -67,8 +67,9 @@ private:
   PlayerStatusWatcher *playerStatusWatcher = nullptr;
   PulseAudioController *m_pulseAudio = nullptr;
   QString m_cachedA2dpProfile;
-  // Set once per connection after asking BlueZ to bring up the A2DP transport.
-  bool m_a2dpProfileRequested = false;
+  // A2DP bring-up state, reset for each connection.
+  int m_a2dpProfileAttempts = 0;
+  bool m_a2dpConnectRequested = false;
 };
 
 #endif // MEDIACONTROLLER_H

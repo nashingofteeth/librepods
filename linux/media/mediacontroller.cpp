@@ -20,6 +20,11 @@
 namespace {
 // BlueZ A2DP sink profile UUID.
 const QString kA2dpSinkUuid = QStringLiteral("0000110b-0000-1000-8000-00805f9b34fb");
+// How long to keep asking BlueZ to bring up A2DP after a reconnect, and how
+// often. The first request often fails with br-connection-create-socket while
+// the AirPods are still settling, so a single attempt is not enough.
+constexpr int kMaxA2dpProfileAttempts = 10;
+constexpr int kA2dpProfileRetryMs = 2000;
 }
 
 MediaController::MediaController(QObject *parent) : QObject(parent) {
@@ -220,20 +225,29 @@ void MediaController::activateA2dpProfile() {
 
   // After a case -> ears reconnect the AirPods may come back with only the AACP
   // link up and no A2DP transport, so PipeWire never creates a bluez_card and
-  // there is no output device at all. Ask BlueZ to connect the A2DP profile,
-  // then retry once after WirePlumber has had a moment to create the card.
+  // there is no output device at all. Ask BlueZ to connect the A2DP profile and
+  // keep retrying for a short while: the first request often fails with
+  // br-connection-create-socket while the AirPods are still settling.
   // See https://github.com/librepods-org/librepods/issues/799
   if (m_deviceOutputName.isEmpty()) {
-    if (!m_a2dpProfileRequested) {
-      m_a2dpProfileRequested = true;
-      LOG_INFO("No Bluetooth audio card for " << connectedDeviceMacAddress
-               << ", requesting A2DP profile via BlueZ");
-      if (connectA2dpProfile()) {
-        QTimer::singleShot(1000, this, &MediaController::activateA2dpProfile);
-      }
-    } else {
-      LOG_WARN("A2DP card still not available for " << connectedDeviceMacAddress);
+    if (m_a2dpProfileAttempts >= kMaxA2dpProfileAttempts) {
+      LOG_WARN("A2DP card still not available for " << connectedDeviceMacAddress
+               << " after " << kMaxA2dpProfileAttempts << " attempts");
+      return;
     }
+
+    m_a2dpProfileAttempts++;
+    if (!m_a2dpConnectRequested) {
+      m_a2dpConnectRequested = connectA2dpProfile();
+      LOG_INFO("No Bluetooth audio card for " << connectedDeviceMacAddress
+               << ", requested A2DP profile via BlueZ (attempt "
+               << m_a2dpProfileAttempts << "/" << kMaxA2dpProfileAttempts << ")");
+    } else {
+      LOG_DEBUG("Waiting for A2DP card for " << connectedDeviceMacAddress
+                << " (attempt " << m_a2dpProfileAttempts << "/"
+                << kMaxA2dpProfileAttempts << ")");
+    }
+    QTimer::singleShot(kA2dpProfileRetryMs, this, &MediaController::activateA2dpProfile);
     return;
   }
 
@@ -327,8 +341,9 @@ void MediaController::setConnectedDeviceMacAddress(const QString &macAddress) {
   connectedDeviceMacAddress = macAddress;
   m_deviceOutputName = getAudioDeviceName();
   m_cachedA2dpProfile.clear();
-  // Allow one A2DP ConnectProfile request for this connection.
-  m_a2dpProfileRequested = false;
+  // Reset A2DP bring-up state for this connection.
+  m_a2dpProfileAttempts = 0;
+  m_a2dpConnectRequested = false;
   LOG_INFO("Device output name set to: " << m_deviceOutputName);
 }
 
